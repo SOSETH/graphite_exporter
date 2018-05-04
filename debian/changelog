@@ -1,0 +1,5 @@
+prometheus-graphite-exporter (0.2.0-d950808) unstable; urgency=medium
+
+  * Initial release, corresponds to upstream commit d950808
+
+ -- Maximilian Falkenstein <mfalkenstein@sos.ethz.ch>  Fri, 04 May 2018 17:42:50 +0200

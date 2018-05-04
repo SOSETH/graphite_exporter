@@ -1,0 +1,14 @@
+[Unit]
+Description=Prometheus graphite exporter
+Documentation=https://github.com/SOSETH/graphite_exporter
+
+[Service]
+Restart=always
+User=prometheus
+ExecStart=/usr/bin/graphite_exporter --web.listen-address="127.0.0.1:9108" --graphite.listen-address="127.0.0.1:9109" --graphite.mapping-config=/etc/prometheus/graphite_exporter_mapping
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=20s
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target

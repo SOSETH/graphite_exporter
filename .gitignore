@@ -3,3 +3,4 @@
 /.tarballs
 /graphite_exporter
 *.tar.gz
+/obj-x86_64-linux-gnu
