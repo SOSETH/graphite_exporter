@@ -1,3 +1,9 @@
+prometheus-graphite-exporter (0.2.0-d950808.1) unstable; urgency=medium
+
+  * Add remapping config for very long icinga2 perfdata fields
+
+ -- Maximilian Falkenstein <mfalkenstein@sos.ethz.ch>  Sun, 20 May 2018 14:10:49 +0200
+
 prometheus-graphite-exporter (0.2.0-d950808) unstable; urgency=medium
 
   * Initial release, corresponds to upstream commit d950808
