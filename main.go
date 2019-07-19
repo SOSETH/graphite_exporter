@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,8 +30,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
+	"github.com/prometheus/statsd_exporter/pkg/mapper"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -41,7 +44,9 @@ var (
 	mappingConfig   = kingpin.Flag("graphite.mapping-config", "Metric mapping configuration file name.").Default("").String()
 	sampleExpiry    = kingpin.Flag("graphite.sample-expiry", "How long a sample is valid for.").Default("5m").Duration()
 	strictMatch     = kingpin.Flag("graphite.mapping-strict-match", "Only store metrics that match the mapping configuration.").Bool()
-	lastProcessed   = prometheus.NewGauge(
+	dumpFSMPath     = kingpin.Flag("debug.dump-fsm", "The path to dump internal FSM generated for glob matching as Dot file.").Default("").String()
+
+	lastProcessed = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "graphite_last_processed_timestamp_seconds",
 			Help: "Unix timestamp of the last processed graphite metric.",
@@ -66,20 +71,30 @@ type graphiteSample struct {
 	Timestamp    time.Time
 }
 
+type metricMapper interface {
+	GetMapping(string, mapper.MetricType) (*mapper.MetricMapping, prometheus.Labels, bool)
+	InitFromFile(string) error
+}
+
 type graphiteCollector struct {
-	samples map[string]*graphiteSample
-	mu      *sync.Mutex
-	mapper  *metricMapper
-	ch      chan *graphiteSample
+	samples     map[string]*graphiteSample
+	mu          *sync.Mutex
+	mapper      metricMapper
+	sampleCh    chan *graphiteSample
+	lineCh      chan string
+	strictMatch bool
 }
 
 func newGraphiteCollector() *graphiteCollector {
 	c := &graphiteCollector{
-		ch:      make(chan *graphiteSample, 0),
-		mu:      &sync.Mutex{},
-		samples: map[string]*graphiteSample{},
+		sampleCh:    make(chan *graphiteSample),
+		lineCh:      make(chan string),
+		mu:          &sync.Mutex{},
+		samples:     map[string]*graphiteSample{},
+		strictMatch: *strictMatch,
 	}
 	go c.processSamples()
+	go c.processLines()
 	return c
 }
 
@@ -89,27 +104,36 @@ func (c *graphiteCollector) processReader(reader io.Reader) {
 		if ok := lineScanner.Scan(); !ok {
 			break
 		}
-		c.processLine(lineScanner.Text())
+		c.lineCh <- lineScanner.Text()
+	}
+}
+
+func (c *graphiteCollector) processLines() {
+	for line := range c.lineCh {
+		c.processLine(line)
 	}
 }
 
 func (c *graphiteCollector) processLine(line string) {
+	line = strings.TrimSpace(line)
+	log.Debugf("Incoming line : %s", line)
 	parts := strings.Split(line, " ")
 	if len(parts) != 3 {
 		log.Infof("Invalid part count of %d in line: %s", len(parts), line)
 		return
 	}
+	originalName := parts[0]
 	var name string
-	labels, present := c.mapper.getMapping(parts[0])
+	mapping, labels, present := c.mapper.GetMapping(originalName, mapper.MetricTypeGauge)
+
+	if (present && mapping.Action == mapper.ActionTypeDrop) || (!present && c.strictMatch) {
+		return
+	}
+
 	if present {
-		name = labels["name"]
-		delete(labels, "name")
+		name = invalidMetricChars.ReplaceAllString(mapping.Name, "_")
 	} else {
-		// If graphite.mapping-strict-match flag is set, we will drop this metric.
-		if *strictMatch {
-			return
-		}
-		name = invalidMetricChars.ReplaceAllString(parts[0], "_")
+		name = invalidMetricChars.ReplaceAllString(originalName, "_")
 	}
 
 	value, err := strconv.ParseFloat(parts[1], 64)
@@ -123,23 +147,28 @@ func (c *graphiteCollector) processLine(line string) {
 		return
 	}
 	sample := graphiteSample{
-		OriginalName: parts[0],
+		OriginalName: originalName,
 		Name:         name,
 		Value:        value,
 		Labels:       labels,
 		Type:         prometheus.GaugeValue,
-		Help:         fmt.Sprintf("Graphite metric %s", parts[0]),
+		Help:         fmt.Sprintf("Graphite metric %s", name),
 		Timestamp:    time.Unix(int64(timestamp), int64(math.Mod(timestamp, 1.0)*1e9)),
 	}
+	log.Debugf("Sample: %+v", sample)
 	lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
-	c.ch <- &sample
+	c.sampleCh <- &sample
 }
 
 func (c *graphiteCollector) processSamples() {
 	ticker := time.NewTicker(time.Minute).C
+
 	for {
 		select {
-		case sample := <-c.ch:
+		case sample, ok := <-c.sampleCh:
+			if sample == nil || !ok {
+				return
+			}
 			c.mu.Lock()
 			c.samples[sample.OriginalName] = sample
 			c.mu.Unlock()
@@ -190,6 +219,20 @@ func init() {
 	prometheus.MustRegister(version.NewCollector("graphite_exporter"))
 }
 
+func dumpFSM(mapper *mapper.MetricMapper, dumpFilename string) error {
+	f, err := os.Create(dumpFilename)
+	if err != nil {
+		return err
+	}
+	log.Infoln("Start dumping FSM to", dumpFilename)
+	w := bufio.NewWriter(f)
+	mapper.FSM.DumpFSM(w)
+	w.Flush()
+	f.Close()
+	log.Infoln("Finish dumping FSM")
+	return nil
+}
+
 func main() {
 	log.AddFlags(kingpin.CommandLine)
 	kingpin.Version(version.Print("graphite_exporter"))
@@ -202,15 +245,22 @@ func main() {
 	log.Infoln("Starting graphite_exporter", version.Info())
 	log.Infoln("Build context", version.BuildContext())
 
-	http.Handle(*metricsPath, prometheus.Handler())
+	http.Handle(*metricsPath, promhttp.Handler())
 	c := newGraphiteCollector()
 	prometheus.MustRegister(c)
 
-	c.mapper = &metricMapper{}
+	c.mapper = &mapper.MetricMapper{}
 	if *mappingConfig != "" {
-		err := c.mapper.initFromFile(*mappingConfig)
+		err := c.mapper.InitFromFile(*mappingConfig)
 		if err != nil {
 			log.Fatalf("Error loading metric mapping config: %s", err)
+		}
+	}
+
+	if *dumpFSMPath != "" {
+		err := dumpFSM(c.mapper.(*mapper.MetricMapper), *dumpFSMPath)
+		if err != nil {
+			log.Fatal("Error dumping FSM:", err)
 		}
 	}
 
@@ -254,6 +304,10 @@ func main() {
 	}()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Write([]byte(`<html>
       <head><title>Graphite Exporter</title></head>
       <body>
