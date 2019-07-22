@@ -7,3 +7,6 @@ export DH_GOPKG=github.com/SOSETH/graphite_exporter
 %:
 	dh $@ --buildsystem=golang --with=golang
 
+override_dh_auto_test:
+	# Skip :/
+

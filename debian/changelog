@@ -1,3 +1,9 @@
+prometheus-graphite-exporter (0.6.2) unstable; urgency=medium
+
+  * Bump to latest upstream release
+
+ -- Maximilian Falkenstein <mfalkenstein@sos.ethz.ch>  Fri, 19 Jul 2019 21:40:08 +0200
+
 prometheus-graphite-exporter (0.2.0-d950808.1) unstable; urgency=medium
 
   * Add remapping config for very long icinga2 perfdata fields
